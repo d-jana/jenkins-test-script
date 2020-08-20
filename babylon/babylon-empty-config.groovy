@@ -8,8 +8,36 @@ def cf_group = 'opentlc-access-cicd'
 def imap_creds = 'd8762f05-ca66-4364-adf2-bc3ce1dca16c'
 def imap_server = 'imap.gmail.com'
 // Notifications
-def notification_email = 'djana@redhat.com'
-def rocketchat_hook = '5d28935e-f7ca-4b11-8b8e-d7a7161a013a'
+def notification_email = 'gucore@redhat.com'
+def google_room_creds = 'google-room-babylon-robots'
+
+/*
+ For the following function, you need the following script approval in jenkins:
+
+ method groovy.lang.GString getBytes java.lang.String
+ method java.io.OutputStream write byte[]
+ method java.net.HttpURLConnection getResponseCode
+ method java.net.HttpURLConnection setRequestMethod java.lang.String
+ method java.net.URL openConnection
+ method java.net.URLConnection getInputStream
+ method java.net.URLConnection getOutputStream
+ method java.net.URLConnection setDoOutput boolean
+ method java.net.URLConnection setRequestProperty java.lang.String java.lang.String
+ staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods getText java.io.InputStream
+*/
+def post_to_room(endpoint, text_content) {
+    def post = new URL("${endpoint}").openConnection();
+    def message = "{\"text\":\"${text_content}\"}"
+    post.setRequestMethod("POST")
+    post.setDoOutput(true)
+    post.setRequestProperty("Content-Type", "application/json")
+    post.getOutputStream().write(message.getBytes("UTF-8"));
+    def postRC = post.getResponseCode();
+    println(postRC);
+    if(postRC.equals(200)) {
+        println(post.getInputStream().getText());
+    }
+}
 
 // SSH key
 def ssh_creds = '15e1788b-ed3c-4b18-8115-574045f32ce4'
@@ -19,19 +47,18 @@ def ssh_admin_host = 'admin-host-na'
 
 // state variables
 def guid=''
-def ssh_location = ''
-
 
 // Catalog items
 def choices = [
-    'DevOps Team Development / DEV Babylon empty-config',
-    'DevOps Deployement Testing / TEST Babylon empty-config',
-//    'DevOps Deployement Testing / PROD Babylon empty-config',
-].join("\n")
-
-def region_choice = [
-    'tests',
-    'tests_prod',
+    'DevOps Team Development / DEV Babylon empty-config / tests',
+    'DevOps Team Development / DEV Babylon empty-config AWS / tests',
+    'DevOps Team Development / DEV Babylon empty-config OSP / tests',
+    'DevOps Deployment Testing / TEST Babylon empty-config / tests_prod',
+    'DevOps Deployment Testing / TEST Babylon empty-config AWS / tests_prod',
+    'DevOps Deployment Testing / TEST Babylon empty-config OSP / tests_prod',
+    'DevOps Deployment Testing / PROD Babylon empty-config / tests_prod',
+    'DevOps Deployment Testing / PROD Babylon empty-config AWS / tests_prod',
+    'DevOps Deployment Testing / PROD Babylon empty-config OSP / tests_prod',
 ].join("\n")
 
 pipeline {
@@ -45,17 +72,17 @@ pipeline {
         booleanParam(
             defaultValue: false,
             description: 'wait for user input before deleting the environment',
-                name: 'confirm_before_delete'
+            name: 'confirm_before_delete',
+        )
+        booleanParam(
+            defaultValue: false,
+            description: 'Additional debug information from Cloudforms API',
+            name: 'cf_debug',
         )
         choice(
             choices: choices,
             description: 'Catalog item',
             name: 'catalog_item',
-        )
-        choice(
-            choices: region_choice,
-            description: 'Region',
-            name: 'region',
         )
     }
 
@@ -64,7 +91,7 @@ pipeline {
             environment {
                 uri = "${cf_uri}"
                 credentials = credentials("${opentlc_creds}")
-                DEBUG = 'true'
+                DEBUG = "${params.cf_debug}"
             }
             /* This step use the order_svc_guid.sh script to order
              a service from CloudForms */
@@ -74,41 +101,42 @@ pipeline {
                 script {
                     def catalog = params.catalog_item.split(' / ')[0].trim()
                     def item = params.catalog_item.split(' / ')[1].trim()
-                    def region = params.region.trim()
-                    def environment = params.environment.trim()
+                    def region = params.catalog_item.split(' / ')[2].trim()
                     echo "'${catalog}' '${item}'"
-                    guid = sh(
-                        returnStdout: true,
-                        script: """
-                          ./opentlc/order_svc_guid.sh \
-                          -c '${catalog}' \
-                          -i '${item}' \
-                          -G '${cf_group}' \
-                          -d 'expiration=7,runtime=8,region=${region}'
-                        """
-                    ).trim()
+
+                    def command = """
+                        ./opentlc/order_svc_guid.sh \
+                        -c '${catalog}' \
+                        -i '${item}' \
+                        -G '${cf_group}' \
+                        -d 'expiration=7,runtime=8,region=${region}'
+                    """
+
+                    try {
+
+                        guid = sh(
+                            returnStdout: true,
+                            script: command
+                        ).trim()
+
+                    } catch(e) {
+
+                        if (! params.cf_debug) {
+                            // Run again but with DEBUG=true
+                            guid = sh(
+                                returnStdout: true,
+                                script: "DEBUG=true " + command
+                            ).trim()
+                        }
+                    }
 
                     echo "GUID is '${guid}'"
+
                 }
             }
         }
-        /* Skip this step because sometimes the completed email arrives
-         before the 'has started' email
-        stage('Wait for first email') {
-            environment {
-                credentials=credentials("${imap_creds}")
-            }
-            steps {
 
-                sh """./tests/jenkins/downstream/poll_email.py \
-                    --server '${imap_server}' \
-                    --guid ${guid} \
-                    --timeout 20 \
-                    --filter 'has started'"""
-            }
-        }
-        */
-        stage('Wait for last email and parse SSH location') {
+        stage('Wait for last email and parse dummy login / password') {
             environment {
                 credentials=credentials("${imap_creds}")
             }
@@ -129,9 +157,9 @@ pipeline {
                     ).trim()
 
                     try {
-                    	def m = email =~ /<pre>. *ssh -i [^ ]+ *([^ <]+?) *<\/pre>/
-                    	ssh_location = m[0][1]
-                    	echo "ssh_location = '${ssh_location}'"
+                    	def m = email =~ /(?m)^Some random (?:string|password) (\w+)$/
+                    	def password = m[0][1]
+                    	echo "password from email = '${password}'"
                     } catch(Exception ex) {
                         echo "Could not parse email:"
                         echo email
@@ -139,20 +167,6 @@ pipeline {
                         throw ex
                     }
 
-                }
-            }
-        }
-
-        stage('SSH') {
-            steps {
-                withCredentials([
-                    sshUserPrivateKey(
-                        credentialsId: ssh_creds,
-                        keyFileVariable: 'ssh_key',
-                        usernameVariable: 'ssh_username')
-                ]) {
-                    sh "ssh -o StrictHostKeyChecking=no -i ${ssh_key} ${ssh_location} w"
-                    sh "ssh -o StrictHostKeyChecking=no -i ${ssh_key} ${ssh_location} oc version"
                 }
             }
         }
@@ -167,12 +181,13 @@ pipeline {
                 input "Continue ?"
             }
         }
+
         stage('Retire service from CF') {
             environment {
                 uri = "${cf_uri}"
                 credentials = credentials("${opentlc_creds}")
                 admin_credentials = credentials("${opentlc_admin_creds}")
-                DEBUG = 'true'
+                DEBUG = "${params.cf_debug}"
             }
             /* This step uses the delete_svc_guid.sh script to retire
              the service from CloudForms */
@@ -180,6 +195,8 @@ pipeline {
                 git 'https://github.com/redhat-gpte-devopsautomation/cloudforms-oob'
 
                 sh "./opentlc/delete_svc_guid.sh '${guid}'"
+
+                // TODO: make sure the string OKTODELETE appears in the logs
             }
             post {
                 failure {
@@ -192,14 +209,9 @@ pipeline {
                             from: credentials.split(':')[0]
                         )
                     }
-                    withCredentials([string(credentialsId: rocketchat_hook, variable: 'HOOK_URL')]) {
-                        sh(
-                            """
-                            curl -H 'Content-Type: application/json' \
-                            -X POST '${HOOK_URL}' \
-                            -d '{\"username\": \"jenkins\", \"icon_url\": \"https://dev-sfo01.opentlc.com/static/81c91982/images/headshot.png\", \"text\": \"@here :rage: ${env.JOB_NAME} (${env.BUILD_NUMBER}) failed retiring ${guid}.\"}'\
-                            """.trim()
-                        )
+                    withCredentials([string(credentialsId: google_room_creds, variable: 'web_hook_endpoint')]) {
+                        post_to_room(web_hook_endpoint,
+                                     "😡 ${env.JOB_NAME} (${env.BUILD_NUMBER}) failed retiring ${guid}.")
                     }
                 }
             }
@@ -232,12 +244,13 @@ pipeline {
             ) {
                 sh """
                 export uri="${cf_uri}"
-                export DEBUG=true
+                export DEBUG="{params.cf_debug}"
                 ./opentlc/delete_svc_guid.sh '${guid}'
                 """
             }
 
             /* Print ansible logs */
+            /* this doesn't work yet
             withCredentials([
                 string(credentialsId: ssh_admin_host, variable: 'ssh_admin'),
                 sshUserPrivateKey(
@@ -246,11 +259,17 @@ pipeline {
                     usernameVariable: 'ssh_username')
             ]) {
                 sh("""
-                    ssh -o StrictHostKeyChecking=no -i ${ssh_key} ${ssh_admin} \
+                    ssh -vvv -o StrictHostKeyChecking=no -i ${ssh_key} ${ssh_admin} \
+                    "uptime"
+                """.trim()
+                )
+                sh("""
+                    ssh -vvv -o StrictHostKeyChecking=no -i ${ssh_key} ${ssh_admin} \
                     "find deployer_logs -name '*${guid}*log' | xargs cat"
                 """.trim()
                 )
             }
+             */
 
             withCredentials([usernameColonPassword(credentialsId: imap_creds, variable: 'credentials')]) {
                 mail(
@@ -261,26 +280,17 @@ pipeline {
                     from: credentials.split(':')[0]
               )
             }
-            withCredentials([string(credentialsId: rocketchat_hook, variable: 'HOOK_URL')]) {
-                sh(
-                    """
-                      curl -H 'Content-Type: application/json' \
-                      -X POST '${HOOK_URL}' \
-                      -d '{\"username\": \"jenkins\", \"icon_url\": \"https://dev-sfo01.opentlc.com/static/81c91982/images/headshot.png\", \"text\": \"@here :rage: ${env.JOB_NAME} (${env.BUILD_NUMBER}) failed GUID=${guid}. It appears that ${env.BUILD_URL}/console is failing, somebody should do something about that.\"}'\
-                    """.trim()
-                )
+            withCredentials([string(credentialsId: google_room_creds, variable: 'web_hook_endpoint')]) {
+                post_to_room(web_hook_endpoint,
+                             "😡 ${env.JOB_NAME} (${env.BUILD_NUMBER}) failed GUID=${guid}. It appears that ${env.BUILD_URL}/console is failing, somebody should do something about that.")
             }
         }
         fixed {
-            withCredentials([string(credentialsId: rocketchat_hook, variable: 'HOOK_URL')]) {
-                sh(
-                    """
-                      curl -H 'Content-Type: application/json' \
-                      -X POST '${HOOK_URL}' \
-                      -d '{\"username\": \"jenkins\", \"icon_url\": \"https://dev-sfo01.opentlc.com/static/81c91982/images/headshot.png\", \"text\": \"@here :smile: ${env.JOB_NAME} is now FIXED, see ${env.BUILD_URL}/console\"}'\
-                    """.trim()
-                )
+            withCredentials([string(credentialsId: google_room_creds, variable: 'web_hook_endpoint')]) {
+                post_to_room(web_hook_endpoint,
+                             "☺ ${env.JOB_NAME} is now FIXED, see ${env.BUILD_URL}/console")
             }
+
         }
     }
 }
